@@ -1,10 +1,12 @@
-// SunnySocialBoost — Paystack backend
+// SunnySocialBoost — Paystack backend (now with a real database)
 // Handles: initializing a payment, verifying it server-side, and a webhook
 // to catch payment confirmations even if the customer closes their browser.
+// Orders are now stored permanently in Postgres instead of memory.
 
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const { Pool } = require("pg");
 require("dotenv").config();
 
 const app = express();
@@ -13,13 +15,39 @@ app.use(express.json());
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PORT = process.env.PORT || 4000;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!PAYSTACK_SECRET_KEY) {
   console.error("Missing PAYSTACK_SECRET_KEY in .env — server cannot start safely.");
   process.exit(1);
 }
 
-const orders = new Map();
+if (!DATABASE_URL) {
+  console.error("Missing DATABASE_URL in .env — server cannot start safely.");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+async function ensureTableExists() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      reference TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      service TEXT NOT NULL,
+      qty INTEGER NOT NULL,
+      link TEXT NOT NULL,
+      amount_naira NUMERIC NOT NULL,
+      status TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      paid_at TIMESTAMPTZ
+    )
+  `);
+  console.log("Orders table ready.");
+}
 
 app.post("/api/orders/initialize", async (req, res) => {
   try {
@@ -52,16 +80,11 @@ app.post("/api/orders/initialize", async (req, res) => {
       return res.status(400).json({ error: paystackData.message || "Could not initialize payment." });
     }
 
-    orders.set(reference, {
-      reference,
-      email,
-      service,
-      qty,
-      link,
-      amountNaira,
-      status: "pending_payment",
-      createdAt: new Date().toISOString(),
-    });
+    await pool.query(
+      `INSERT INTO orders (reference, email, service, qty, link, amount_naira, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending_payment')`,
+      [reference, email, service, qty, link, amountNaira]
+    );
 
     return res.json({
       authorization_url: paystackData.data.authorization_url,
@@ -77,7 +100,9 @@ app.post("/api/orders/initialize", async (req, res) => {
 app.get("/api/orders/verify/:reference", async (req, res) => {
   try {
     const { reference } = req.params;
-    const order = orders.get(reference);
+
+    const orderResult = await pool.query("SELECT * FROM orders WHERE reference = $1", [reference]);
+    const order = orderResult.rows[0];
 
     if (!order) {
       return res.status(404).json({ error: "Order not found." });
@@ -98,22 +123,22 @@ app.get("/api/orders/verify/:reference", async (req, res) => {
     const txn = paystackData.data;
 
     if (txn.status === "success") {
-      const expectedKobo = Math.round(Number(order.amountNaira) * 100);
+      const expectedKobo = Math.round(Number(order.amount_naira) * 100);
       if (txn.amount !== expectedKobo) {
-        order.status = "amount_mismatch";
-        orders.set(reference, order);
+        await pool.query("UPDATE orders SET status = 'amount_mismatch' WHERE reference = $1", [reference]);
         return res.status(400).json({ error: "Amount mismatch — do not fulfill this order." });
       }
 
-      order.status = "paid";
-      order.paidAt = new Date().toISOString();
-      orders.set(reference, order);
+      await pool.query(
+        "UPDATE orders SET status = 'paid', paid_at = now() WHERE reference = $1",
+        [reference]
+      );
 
-      return res.json({ status: "paid", order });
+      const updated = await pool.query("SELECT * FROM orders WHERE reference = $1", [reference]);
+      return res.json({ status: "paid", order: updated.rows[0] });
     } else {
-      order.status = "failed";
-      orders.set(reference, order);
-      return res.json({ status: "failed", order });
+      await pool.query("UPDATE orders SET status = 'failed' WHERE reference = $1", [reference]);
+      return res.json({ status: "failed" });
     }
   } catch (err) {
     console.error("Verify error:", err);
@@ -121,7 +146,7 @@ app.get("/api/orders/verify/:reference", async (req, res) => {
   }
 });
 
-app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), (req, res) => {
+app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), async (req, res) => {
   const signature = req.headers["x-paystack-signature"];
   const body = req.body;
 
@@ -138,18 +163,20 @@ app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), (req, res) => {
 
   if (event.event === "charge.success") {
     const reference = event.data.reference;
-    const order = orders.get(reference);
-    if (order && order.status !== "paid") {
-      order.status = "paid";
-      order.paidAt = new Date().toISOString();
-      orders.set(reference, order);
+    try {
+      await pool.query(
+        "UPDATE orders SET status = 'paid', paid_at = now() WHERE reference = $1 AND status != 'paid'",
+        [reference]
+      );
+    } catch (err) {
+      console.error("Webhook DB update error:", err);
     }
   }
 
   return res.sendStatus(200);
 });
 
-app.get("/api/orders", (req, res) => {
+app.get("/api/orders", async (req, res) => {
   const providedKey = req.query.key;
   const ADMIN_KEY = process.env.ADMIN_KEY;
 
@@ -160,9 +187,22 @@ app.get("/api/orders", (req, res) => {
     return res.status(401).json({ error: "Unauthorized. Add ?key=YOUR_ADMIN_KEY to the URL." });
   }
 
-  res.json(Array.from(orders.values()));
+  try {
+    const result = await pool.query("SELECT * FROM orders ORDER BY created_at DESC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error("List orders error:", err);
+    res.status(500).json({ error: "Could not fetch orders." });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`SunnySocialBoost backend running on port ${PORT}`);
-});
+ensureTableExists()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`SunnySocialBoost backend running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to set up database table:", err);
+    process.exit(1);
+  });
