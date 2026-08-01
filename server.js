@@ -12,7 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-console.log("DEBUG - all env keys:const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 4000;
 
 if (!PAYSTACK_SECRET_KEY) {
   console.error("Missing PAYSTACK_SECRET_KEY in .env — server cannot start safely.");
