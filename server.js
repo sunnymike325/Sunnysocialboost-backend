@@ -150,6 +150,16 @@ app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), (req, res) => {
 });
 
 app.get("/api/orders", (req, res) => {
+  const providedKey = req.query.key;
+  const ADMIN_KEY = process.env.ADMIN_KEY;
+
+  if (!ADMIN_KEY) {
+    return res.status(500).json({ error: "Admin key not configured on server." });
+  }
+  if (providedKey !== ADMIN_KEY) {
+    return res.status(401).json({ error: "Unauthorized. Add ?key=YOUR_ADMIN_KEY to the URL." });
+  }
+
   res.json(Array.from(orders.values()));
 });
 
